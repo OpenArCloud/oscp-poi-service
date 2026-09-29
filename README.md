@@ -44,6 +44,8 @@ GOOGLE_MAPS_API_KEY=
 PORT=8043
 MY_HTTP_PROXY=
 MY_HTTPS_PROXY=
+# Optional comma-separated Overpass endpoints, tried in order
+OVERPASS_URLS=
 ```
 
 Build the container:

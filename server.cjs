@@ -19,6 +19,9 @@ const apiKey = process.env.GOOGLE_MAPS_API_KEY;
 const searchRadius = 200;
 const UPSTREAM_TIMEOUT_MS = 10000;
 const MAX_QUERY_LENGTH = 200;
+// Public Overpass instances are frequently overloaded, so they are tried in order
+const OVERPASS_URLS = (process.env.OVERPASS_URLS || "https://overpass-api.de/api/interpreter")
+  .split(",").map(url => url.trim()).filter(Boolean);
 
 let OSMenable = true;
 
@@ -374,7 +377,7 @@ app.get("/locations", async (req, res, next) => {
       warnings.push("Google Places skipped: GOOGLE_MAPS_API_KEY is not configured on the server");
     }
 
-    const apiURLOpenStreetMap = "https://overpass-api.de/api/interpreter";
+    const overpassTimeoutSeconds = Math.floor(UPSTREAM_TIMEOUT_MS / 1000) - 1;
     let word = checkAmenity(textQuery);
     let amenities = "";
     let query = ''
@@ -382,7 +385,7 @@ app.get("/locations", async (req, res, next) => {
       // Escape regex metacharacters, then quotes/backslashes for the Overpass string literal
       const safeName = textQuery.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/["\\]/g, "\\$&");
       query = `
-      [out:json];
+      [out:json][timeout:${overpassTimeoutSeconds}];
       node
       ["amenity"]
       ["name"~"${safeName}", i]
@@ -405,7 +408,7 @@ app.get("/locations", async (req, res, next) => {
         word = '="' + word;
       }
       query = `
-      [out:json];
+      [out:json][timeout:${overpassTimeoutSeconds}];
       node
       ["amenity"${word}"]
       (around:${searchRadius}, ${myLat}, ${myLng});
@@ -416,16 +419,28 @@ app.get("/locations", async (req, res, next) => {
       OSMenable = false;
       await collect("OpenStreetMap Overpass", async () => {
         try {
-          // Overpass rejects anonymous clients with 406; it requires an identifying User-Agent
-          const data = await fetchJson("OpenStreetMap Overpass", apiURLOpenStreetMap, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/x-www-form-urlencoded",
-              "Accept": "application/json",
-              "User-Agent": "oscp-poi-service/1.0"
-            },
-            body: new URLSearchParams({ data: query }).toString()
-          });
+          let data;
+          const errors = [];
+          for (const url of OVERPASS_URLS) {
+            try {
+              // Overpass rejects anonymous clients with 406; it requires an identifying User-Agent
+              data = await fetchJson(`OpenStreetMap Overpass (${new URL(url).host})`, url, {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/x-www-form-urlencoded",
+                  "Accept": "application/json",
+                  "User-Agent": "oscp-poi-service/1.0"
+                },
+                body: new URLSearchParams({ data: query }).toString()
+              });
+              break;
+            } catch (error) {
+              errors.push(error.message);
+            }
+          }
+          if (!data) {
+            throw new ApiError(502, errors.join("; "));
+          }
           const osmPois = [];
           (data.elements || []).forEach(place => {
             const tags = place.tags || {};

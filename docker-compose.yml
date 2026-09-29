@@ -12,6 +12,7 @@ services:
       - HTTPS_PROXY=${MY_HTTPS_PROXY}
       - PORT=3000
       - GOOGLE_MAPS_API_KEY=${GOOGLE_MAPS_API_KEY}
+      - OVERPASS_URLS=${OVERPASS_URLS:-}
     deploy:
       restart_policy:
         condition: on-failure
