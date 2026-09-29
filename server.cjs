@@ -416,7 +416,16 @@ app.get("/locations", async (req, res, next) => {
       OSMenable = false;
       await collect("OpenStreetMap Overpass", async () => {
         try {
-          const data = await fetchJson("OpenStreetMap Overpass", apiURLOpenStreetMap, { method: "POST", body: query });
+          // Overpass rejects anonymous clients with 406; it requires an identifying User-Agent
+          const data = await fetchJson("OpenStreetMap Overpass", apiURLOpenStreetMap, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/x-www-form-urlencoded",
+              "Accept": "application/json",
+              "User-Agent": "oscp-poi-service/1.0"
+            },
+            body: new URLSearchParams({ data: query }).toString()
+          });
           const osmPois = [];
           (data.elements || []).forEach(place => {
             const tags = place.tags || {};
