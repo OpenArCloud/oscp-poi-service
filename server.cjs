@@ -5,17 +5,20 @@ require('https').globalAgent.options.ca = require('ssl-root-cas').create();
 
 // Network proxy
 const { setGlobalDispatcher, ProxyAgent } = require("undici");
-if (process.env.https_proxy) {
+const httpsProxy = process.env.HTTPS_PROXY || process.env.https_proxy;
+if (httpsProxy) {
   // Corporate proxy uses CA not in undici's certificate store
   //process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
-  const dispatcher = new ProxyAgent({uri: new URL(process.env.https_proxy).toString() });
+  const dispatcher = new ProxyAgent({uri: new URL(httpsProxy).toString() });
   setGlobalDispatcher(dispatcher);
 }
 
 
 const PORT = process.env.PORT || 3000;
-const apiKey = `${process.env.GOOGLE_MAPS_API_KEY}`;
+const apiKey = process.env.GOOGLE_MAPS_API_KEY;
 const searchRadius = 200;
+const UPSTREAM_TIMEOUT_MS = 10000;
+const MAX_QUERY_LENGTH = 200;
 
 let OSMenable = true;
 
@@ -41,7 +44,7 @@ const amenities = ["bar", "bbq", "biergarten", "cafe", "fast_food", "food_court"
 function checkAmenity(keyword){
   let newKeywords = [];
   keyword = keyword.toLowerCase();
-  keyword = keyword.replace(" ", "_");
+  keyword = keyword.replaceAll(" ", "_");
   amenities.forEach((amenity) => {
       if(amenity.includes(keyword)){
           newKeywords[newKeywords.length] = amenity;
@@ -86,7 +89,7 @@ function withinRadius(positionLat, positionLng, placeLat, placeLng, radius) {
 }
 
 function getAddressDetails(address){
-  let parts = address.split(",").map(part => part.trim());
+  let parts = (address || "").split(",").map(part => part.trim());
 
   const placeCity = parts[0];
   const placeAddress = parts[1];
@@ -182,7 +185,7 @@ function containsWithName(poiArray, name, lat, lng){
 
 //checks if there is a poi with more information with the same name, if there is, it return that poi
 function moreDataWithThisName(poiArray, datacount, name, lat, lng){
-  betterPoi = undefined;
+  let betterPoi = undefined;
   let maxDatacount = datacount;
 
   for(let i = 0; i < poiArray.length; i++){
@@ -228,7 +231,7 @@ function removeDuplicatesbyName(poiArray){
 
     for(let i = 0; i < newPoiArray.length; i++){
       if(newPoiArray[i].name.name != undefined){
-        datacount = 0;
+        let datacount = 0;
         if(newPoiArray[i].haspayload.address.deliveryPoint != undefined){
           datacount++;
         }
@@ -241,7 +244,7 @@ function removeDuplicatesbyName(poiArray){
         if(newPoiArray[i].haspayload.address.country != undefined){
           datacount++;
         }
-        newPoi = moreDataWithThisName(poiArray, datacount, newPoiArray[i].name.name, newPoiArray[i].geometry.coordinates[0],newPoiArray[i].geometry.coordinates[1]);
+        let newPoi = moreDataWithThisName(poiArray, datacount, newPoiArray[i].name.name, newPoiArray[i].geometry.coordinates[0],newPoiArray[i].geometry.coordinates[1]);
         if(newPoi != undefined){
           newPoiArray[i] = newPoi;
         }
@@ -250,63 +253,132 @@ function removeDuplicatesbyName(poiArray){
     return newPoiArray;
 }
 
-app.get("/locations", async (req, res) => {
+class ApiError extends Error {
+  constructor(status, message, details) {
+    super(message);
+    this.status = status;
+    this.details = details;
+  }
+}
+
+async function fetchJson(source, url, options = {}) {
+  let response;
   try {
-    const myLat = parseFloat(req.query.lat);
-    const myLng = parseFloat(req.query.lng);
-    const textQuery = req.query.textQuery;
+    response = await fetch(url, { ...options, signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) });
+  } catch (error) {
+    if (error.name === "TimeoutError") {
+      throw new ApiError(504, `${source} did not respond within ${UPSTREAM_TIMEOUT_MS / 1000} seconds`);
+    }
+    throw new ApiError(502, `Could not reach ${source}: ${error.cause?.message || error.message}`);
+  }
+  if (!response.ok) {
+    throw new ApiError(502, `${source} returned HTTP ${response.status} ${response.statusText}`);
+  }
+  try {
+    return await response.json();
+  } catch {
+    throw new ApiError(502, `${source} returned an invalid JSON response`);
+  }
+}
 
-    let apiURLtextSearch = `https://maps.googleapis.com/maps/api/place/textsearch/json?location=${myLat},${myLng}&query=${textQuery}&radius=${searchRadius}&key=${apiKey}`;
-    
-    let pois = [];
+async function fetchGooglePlaces(source, url) {
+  const data = await fetchJson(source, url);
+  if (data.status !== "OK" && data.status !== "ZERO_RESULTS") {
+    throw new ApiError(502, `${source} failed with status ${data.status}${data.error_message ? `: ${data.error_message}` : ""}`);
+  }
+  return data.results || [];
+}
 
-    const textSearchResponse = await fetch(apiURLtextSearch);
-    const textSearchData = await textSearchResponse.json();
+function googlePlacesToPOIs(places, myLat, myLng, addressField) {
+  const pois = [];
+  places.forEach(place => {
+    const location = place.geometry?.location;
+    if (!location || !place.name) {
+      return;
+    }
+    if (withinRadius(myLat, myLng, location.lat, location.lng, searchRadius)) {
+      //The address comes as a string in the following format: City, Address, Postal-Code Country, This is only true for google
+      const addressDetails = getAddressDetails(place[addressField]);
+      pois.push(createPOI(location.lat, location.lng, place.name, addressDetails.address, addressDetails.city, addressDetails.country, addressDetails.postalCode, place.types?.[0]));
+    }
+  });
+  return pois;
+}
 
-    const textSearchPlaces = textSearchData.results;
+// Rejects arrays/objects (e.g. ?lat=1&lat=2) and partial numbers like "12abc" that parseFloat would accept
+function parseCoordinate(value, name, limit) {
+  const number = typeof value === "string" && value.trim() !== "" ? Number(value) : NaN;
+  if (!Number.isFinite(number) || Math.abs(number) > limit) {
+    throw new ApiError(400, `Query parameter '${name}' is required and must be a single number between -${limit} and ${limit}`);
+  }
+  return number;
+}
 
-    await textSearchPlaces.forEach(place => {
-      let placeLat = place.geometry.location.lat;
-      let placeLng = place.geometry.location.lng;
-      if (withinRadius(myLat, myLng, placeLat, placeLng, searchRadius)) {
-        let addressDetails = getAddressDetails(place.formatted_address);
-        let poi = createPOI(placeLat, placeLng, place.name, addressDetails.address, addressDetails.city,addressDetails.country, addressDetails.postalCode, place.types[0]);
-        if(poi.name.name != undefined){
-          pois.push(poi);
-        }
+function parseTextQuery(value) {
+  if (Array.isArray(value)) {
+    throw new ApiError(400, "Query parameter 'textQuery' must be given only once");
+  }
+  // eslint-disable-next-line no-control-regex
+  const text = typeof value === "string" ? value.replace(/[\u0000-\u001f\u007f]/g, " ").trim() : "";
+  if (!text) {
+    throw new ApiError(400, "Query parameter 'textQuery' is required and must not be empty");
+  }
+  if (text.length > MAX_QUERY_LENGTH) {
+    throw new ApiError(400, `Query parameter 'textQuery' must be at most ${MAX_QUERY_LENGTH} characters`);
+  }
+  return text;
+}
+
+app.get("/locations", async (req, res, next) => {
+  try {
+    const myLat = parseCoordinate(req.query.lat, "lat", 90);
+    const myLng = parseCoordinate(req.query.lng, "lng", 180);
+    const textQuery = parseTextQuery(req.query.textQuery);
+
+    const pois = [];
+    const warnings = [];
+    let attempted = 0;
+    let failed = 0;
+
+    // A failing source is reported as a warning so the remaining sources can still return results
+    const collect = async (source, fetchPOIs) => {
+      attempted++;
+      try {
+        pois.push(...await fetchPOIs());
+      } catch (error) {
+        failed++;
+        console.error(`${source} error:`, error);
+        warnings.push(error instanceof ApiError ? error.message : `${source} failed: ${error.message}`);
       }
-    });
+    };
 
-    let apiURLnearbySearch = `https://maps.googleapis.com/maps/api/place/nearbysearch/json?keyword=${textQuery}&location=${myLat}%2C${myLng}&&radius=${searchRadius}&key=${apiKey}`;
-    
-    const nearbySearchResponse = await fetch(apiURLnearbySearch);
-    const nearbySearchData = await nearbySearchResponse.json();
+    const encodedQuery = encodeURIComponent(textQuery);
 
-    const nearbySearchPlaces = nearbySearchData.results;
-
-    await nearbySearchPlaces.forEach(place =>{
-      let placeLat = place.geometry.location.lat;
-      let placeLng = place.geometry.location.lng;
-      if (withinRadius(myLat, myLng, placeLat, placeLng, searchRadius)){
-        let addressDetails = getAddressDetails(place.vicinity);
-        //The country address always comes as a string in the following format: City, Address, Postal-Code Country, This is only true for google
-        let poi = createPOI(placeLat, placeLng, place.name, addressDetails.address, addressDetails.city,addressDetails.country, addressDetails.postalCode , place.types[0]);
-        if(poi.name.name != undefined){
-          pois.push(poi);
-        }
-      }
-    });
+    if (apiKey) {
+      await collect("Google Places text search", async () => {
+        const url = `https://maps.googleapis.com/maps/api/place/textsearch/json?location=${myLat},${myLng}&query=${encodedQuery}&radius=${searchRadius}&key=${apiKey}`;
+        return googlePlacesToPOIs(await fetchGooglePlaces("Google Places text search", url), myLat, myLng, "formatted_address");
+      });
+      await collect("Google Places nearby search", async () => {
+        const url = `https://maps.googleapis.com/maps/api/place/nearbysearch/json?keyword=${encodedQuery}&location=${myLat}%2C${myLng}&radius=${searchRadius}&key=${apiKey}`;
+        return googlePlacesToPOIs(await fetchGooglePlaces("Google Places nearby search", url), myLat, myLng, "vicinity");
+      });
+    } else {
+      warnings.push("Google Places skipped: GOOGLE_MAPS_API_KEY is not configured on the server");
+    }
 
     const apiURLOpenStreetMap = "https://overpass-api.de/api/interpreter";
     let word = checkAmenity(textQuery);
     let amenities = "";
     let query = ''
     if (word.length == 0){
+      // Escape regex metacharacters, then quotes/backslashes for the Overpass string literal
+      const safeName = textQuery.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/["\\]/g, "\\$&");
       query = `
       [out:json];
       node
       ["amenity"]
-      ["name"~"${textQuery}", i]
+      ["name"~"${safeName}", i]
       (around:${searchRadius}, ${myLat}, ${myLng});
       out;
       `;
@@ -335,58 +407,83 @@ app.get("/locations", async (req, res) => {
     }
     if(OSMenable){
       OSMenable = false;
-      console.log("OSM disabled");
-      await fetch(apiURLOpenStreetMap, { method: "POST", body: query })
-        .then(response => response.json())
-        .then(data => {
-          setTimeout(() => {
-            OSMenable = true;
-            console.log("OSM enabled again")
-          },1200);
-          data.elements.forEach(place => {
-            let lat = place.lat;
-            let lon = place.lon;
-            let city = place.tags["addr:city"];
-            let postCode = place.tags["addr:postcode"];
-            let street = place.tags["addr:street"];
-            let houseNumber = place.tags["addr:housenumber"];
-            let deliveryPoint;
-            if(street === undefined || houseNumber === undefined){
-                deliveryPoint = undefined;
-            }
-            else{
-                deliveryPoint = street + ' ' + houseNumber;
-            }
-            let name = place.tags.name;
-            let country = place.tags["addr:country"];
-            let category = place.amenity;
-            let poi = createPOI(lat,lon,name,deliveryPoint,city,country, postCode, category);
-            if(poi.name.name != undefined){
-              pois.push(poi);
+      await collect("OpenStreetMap Overpass", async () => {
+        try {
+          const data = await fetchJson("OpenStreetMap Overpass", apiURLOpenStreetMap, { method: "POST", body: query });
+          const osmPois = [];
+          (data.elements || []).forEach(place => {
+            const tags = place.tags || {};
+            let street = tags["addr:street"];
+            let houseNumber = tags["addr:housenumber"];
+            let deliveryPoint = (street === undefined || houseNumber === undefined) ? undefined : street + ' ' + houseNumber;
+            if(tags.name != undefined){
+              osmPois.push(createPOI(place.lat, place.lon, tags.name, deliveryPoint, tags["addr:city"], tags["addr:country"], tags["addr:postcode"], tags.amenity));
             }
           });
-        })
-        .catch(error => {console.error("Error fetching Overpass data:", error);
-            setTimeout(() => {
-                OSMenable = true;
-                console.log("OSM enabled again");
-              }, 1200);
-        });
-      }
+          return osmPois;
+        } finally {
+          setTimeout(() => { OSMenable = true; }, 1200);
+        }
+      });
+    } else {
+      warnings.push("OpenStreetMap skipped: rate limited, please retry in a moment");
+    }
 
-   const newPois = removeDuplicatesbyName(pois);
+    if (attempted === 0) {
+      throw new ApiError(503, "No POI sources are currently available", warnings);
+    }
+    if (failed === attempted) {
+      throw new ApiError(502, "All POI sources failed", warnings);
+    }
 
     const POICollection = {
       type: "FeatureCollection",
-      features: newPois
+      features: removeDuplicatesbyName(pois)
     };
+    if (warnings.length > 0) {
+      POICollection.warnings = warnings;
+    }
     res.json(POICollection);
   } catch (error) {
-    console.error("Error fetching data:", error);
-    res.status(500).json({ error: "Internal Server Error" });
+    next(error);
   }
 });
 
+app.use((req, res) => {
+  res.status(404).json({ error: `Route ${req.method} ${req.path} not found` });
+});
+
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+  if (res.headersSent) {
+    return next(err);
+  }
+  if (err.type === "entity.parse.failed") {
+    return res.status(400).json({ error: "Request body is not valid JSON" });
+  }
+  const rawStatus = err.status || err.statusCode;
+  const status = Number.isInteger(rawStatus) && rawStatus >= 400 && rawStatus < 600 ? rawStatus : 500;
+  if (status >= 500) {
+    console.error(`Error handling ${req.method} ${req.originalUrl}:`, err);
+  }
+  const body = { error: (err instanceof ApiError || err.expose) ? err.message : "Internal server error" };
+  if (err.details) {
+    body.details = err.details;
+  }
+  res.status(status).json(body);
+});
+
+// Last resort: keep serving other requests instead of taking the whole service down
+process.on("unhandledRejection", (reason) => {
+  console.error("Unhandled promise rejection:", reason);
+});
+process.on("uncaughtException", (error) => {
+  console.error("Uncaught exception:", error);
+});
+
 app.listen(PORT, () => {
-  console.log(`API is running at http://localhost:${PORT}`);
+  console.log(`OSCP POI Service is running at http://localhost:${PORT}`);
+  if (!apiKey) {
+    console.warn("GOOGLE_MAPS_API_KEY is not set; only OpenStreetMap will be queried");
+  }
 });
