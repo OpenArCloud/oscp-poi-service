@@ -88,25 +88,23 @@ function withinRadius(positionLat, positionLng, placeLat, placeLng, radius) {
   }
 }
 
-function getAddressDetails(address){
-  let parts = (address || "").split(",").map(part => part.trim());
-
-  const placeCity = parts[0];
-  const placeAddress = parts[1];
-  let placePostalCode = undefined;
-  let placeCountry = undefined;
-
-  if(parts.length > 2){
-    placePostalCode = parts[2].split(" ")[0];
-    placeCountry = parts[2].split(" ").slice(1).join(" ");
-  }
-
-    return {
-        city: placeCity,         
-        address: placeAddress,                 
-        postalCode: placePostalCode,
-        country: placeCountry
-    };
+function getAddressDetails(addressComponents) {
+  const component = (...types) => {
+    for (const type of types) {
+      const match = (addressComponents || []).find(c => c.types?.includes(type));
+      if (match) {
+        return match.longText;
+      }
+    }
+    return undefined;
+  };
+  const street = [component("route"), component("street_number")].filter(Boolean).join(" ");
+  return {
+    city: component("locality", "postal_town", "administrative_area_level_3"),
+    address: street || undefined,
+    postalCode: component("postal_code"),
+    country: component("country")
+  };
 }
 
 function createPOI(placeLat, placeLng, placeName, address, city, country, postalCode, placeCategory) {
@@ -272,7 +270,9 @@ async function fetchJson(source, url, options = {}) {
     throw new ApiError(502, `Could not reach ${source}: ${error.cause?.message || error.message}`);
   }
   if (!response.ok) {
-    throw new ApiError(502, `${source} returned HTTP ${response.status} ${response.statusText}`);
+    // Google APIs return {error: {message}} bodies that explain the failure
+    const upstreamMessage = await response.json().then(body => body?.error?.message, () => undefined);
+    throw new ApiError(502, `${source} returned HTTP ${response.status} ${response.statusText}${upstreamMessage ? `: ${upstreamMessage}` : ""}`);
   }
   try {
     return await response.json();
@@ -281,25 +281,38 @@ async function fetchJson(source, url, options = {}) {
   }
 }
 
-async function fetchGooglePlaces(source, url) {
-  const data = await fetchJson(source, url);
-  if (data.status !== "OK" && data.status !== "ZERO_RESULTS") {
-    throw new ApiError(502, `${source} failed with status ${data.status}${data.error_message ? `: ${data.error_message}` : ""}`);
-  }
-  return data.results || [];
+// Places API (New) Text Search: https://developers.google.com/maps/documentation/places/web-service/text-search
+async function fetchGooglePlaces(source, textQuery, lat, lng) {
+  const data = await fetchJson(source, "https://places.googleapis.com/v1/places:searchText", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Goog-Api-Key": apiKey,
+      "X-Goog-FieldMask": "places.displayName,places.location,places.addressComponents,places.primaryType,places.types"
+    },
+    body: JSON.stringify({
+      textQuery,
+      pageSize: 20,
+      rankPreference: "DISTANCE",
+      locationBias: {
+        circle: { center: { latitude: lat, longitude: lng }, radius: searchRadius }
+      }
+    })
+  });
+  return data.places || [];
 }
 
-function googlePlacesToPOIs(places, myLat, myLng, addressField) {
+function googlePlacesToPOIs(places, myLat, myLng) {
   const pois = [];
   places.forEach(place => {
-    const location = place.geometry?.location;
-    if (!location || !place.name) {
+    const location = place.location;
+    const name = place.displayName?.text;
+    if (!location || !name) {
       return;
     }
-    if (withinRadius(myLat, myLng, location.lat, location.lng, searchRadius)) {
-      //The address comes as a string in the following format: City, Address, Postal-Code Country, This is only true for google
-      const addressDetails = getAddressDetails(place[addressField]);
-      pois.push(createPOI(location.lat, location.lng, place.name, addressDetails.address, addressDetails.city, addressDetails.country, addressDetails.postalCode, place.types?.[0]));
+    if (withinRadius(myLat, myLng, location.latitude, location.longitude, searchRadius)) {
+      const addressDetails = getAddressDetails(place.addressComponents);
+      pois.push(createPOI(location.latitude, location.longitude, name, addressDetails.address, addressDetails.city, addressDetails.country, addressDetails.postalCode, place.primaryType || place.types?.[0]));
     }
   });
   return pois;
@@ -352,16 +365,10 @@ app.get("/locations", async (req, res, next) => {
       }
     };
 
-    const encodedQuery = encodeURIComponent(textQuery);
-
     if (apiKey) {
+      // Nearby Search (New) has no free-text keyword, so a single distance-ranked Text Search replaces both legacy calls
       await collect("Google Places text search", async () => {
-        const url = `https://maps.googleapis.com/maps/api/place/textsearch/json?location=${myLat},${myLng}&query=${encodedQuery}&radius=${searchRadius}&key=${apiKey}`;
-        return googlePlacesToPOIs(await fetchGooglePlaces("Google Places text search", url), myLat, myLng, "formatted_address");
-      });
-      await collect("Google Places nearby search", async () => {
-        const url = `https://maps.googleapis.com/maps/api/place/nearbysearch/json?keyword=${encodedQuery}&location=${myLat}%2C${myLng}&radius=${searchRadius}&key=${apiKey}`;
-        return googlePlacesToPOIs(await fetchGooglePlaces("Google Places nearby search", url), myLat, myLng, "vicinity");
+        return googlePlacesToPOIs(await fetchGooglePlaces("Google Places text search", textQuery, myLat, myLng), myLat, myLng);
       });
     } else {
       warnings.push("Google Places skipped: GOOGLE_MAPS_API_KEY is not configured on the server");
